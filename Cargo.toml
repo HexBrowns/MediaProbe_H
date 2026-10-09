@@ -1,0 +1,20 @@
+[package]
+name = "media-probe-h"
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+authors = ["HexBrowns"]
+description = "MediaProbe_H - 選んでいる素材のコーデック・フレームレート・色空間などを出す AviUtl2 プラグイン"
+publish = false
+
+[lib]
+name = "media_probe_h"
+crate-type = ["cdylib"]
+
+[dependencies]
+aviutl2 = { version = "0.48", features = ["generic"] }
+aviutl2-eframe = "0.48"
+parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"

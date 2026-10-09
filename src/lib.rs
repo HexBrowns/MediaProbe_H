@@ -1,0 +1,134 @@
+//! MediaProbe_H（素材情報）
+//!
+//! 選んでいる動画・音声・画像オブジェクトの素材ファイルについて、コーデック・フレームレート（可変かどうか）・色空間・
+//! ビット深度・サンプルレートを出し、シーンの設定と合わないものに印を付ける。情報は ffprobe で取る。
+//! 仕様は `AI/specifications/20261005_MediaInfo_H_spec.md`（企画時の名前は MediaInfo_H。MediaInfo は他者の製品名なので改めた）。
+//!
+//! - 本体には何も書き込まない（`call_edit_section` は一度も呼ばない）。読み取りは `call_read_section` だけ
+//! - 調べる処理は 1 本のスレッド（`worker.rs`）。プラグインの `Drop` で止めて終わりを待つ
+//! - 第 2 段階: 表示中のシーンの素材をまとめて調べる、可変の判定をファイル全体で行う（どちらもボタンを押したときだけ）
+
+mod check;
+mod gui;
+mod probe;
+mod worker;
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use aviutl2::AnyResult;
+use parking_lot::{Mutex, RwLock};
+
+use worker::{Shared, SharedState, Status, Worker, EDIT_HANDLE};
+
+pub const WINDOW_NAME: &str = "素材情報";
+
+fn init_logging() {
+    use aviutl2::tracing::Level;
+    let level = if cfg!(debug_assertions) { Level::DEBUG } else { Level::INFO };
+    let _ = aviutl2::tracing_subscriber::fmt()
+        .with_max_level(level)
+        .event_format(aviutl2::logger::AviUtl2Formatter)
+        .with_writer(aviutl2::logger::AviUtl2LogWriter)
+        .try_init();
+}
+
+/// 設定ファイル（`Plugin/MediaProbe_H/設定.json`）。今は ffprobe の場所だけ
+pub fn settings_path() -> PathBuf {
+    aviutl2::config::app_data_path().join("Plugin").join("MediaProbe_H").join("設定.json")
+}
+
+pub fn load_ffprobe_setting() -> Option<PathBuf> {
+    let text = std::fs::read_to_string(settings_path()).ok()?;
+    let v: serde_json::Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).ok()?;
+    v.get("ffprobe").and_then(|s| s.as_str()).filter(|s| !s.is_empty()).map(PathBuf::from)
+}
+
+pub fn save_ffprobe_setting(path: Option<&std::path::Path>) -> Result<(), String> {
+    let p = settings_path();
+    if let Some(dir) = p.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let v = serde_json::json!({ "ffprobe": path.map(|p| p.to_string_lossy().into_owned()).unwrap_or_default() });
+    std::fs::write(&p, serde_json::to_string_pretty(&v).unwrap_or_default()).map_err(|e| format!("設定を保存できませんでした: {e}"))
+}
+
+#[aviutl2::plugin(GenericPlugin)]
+pub struct MediaProbePlugin {
+    window: Mutex<Option<aviutl2_eframe::EframeWindow>>,
+    shared: SharedState,
+    worker: Option<Worker>,
+}
+
+impl aviutl2::generic::GenericPlugin for MediaProbePlugin {
+    fn new(_info: aviutl2::AviUtl2Info) -> AnyResult<Self> {
+        init_logging();
+        tracing::info!("MediaProbe_H v{} 初期化", env!("CARGO_PKG_VERSION"));
+        let shared = Arc::new(RwLock::new(Shared {
+            status: Status::Idle(String::new()),
+            scan: Default::default(),
+            whole_running: false,
+            egui_ctx: None,
+            ffprobe_setting: load_ffprobe_setting(),
+        }));
+        Ok(Self { window: Mutex::new(None), shared, worker: None })
+    }
+
+    fn plugin_info(&self) -> aviutl2::generic::GenericPluginTable {
+        aviutl2::generic::GenericPluginTable {
+            name: "MediaProbe_H".to_string(),
+            information: format!("MediaProbe_H v{} - 素材情報 / by HexBrowns", env!("CARGO_PKG_VERSION")),
+        }
+    }
+
+    fn register(&mut self, registry: &mut aviutl2::generic::HostAppHandle) {
+        EDIT_HANDLE.init(registry.create_edit_handle());
+        let plugin_dir = aviutl2::config::app_data_path().join("Plugin");
+        let worker = Worker::start(Arc::clone(&self.shared), plugin_dir.clone());
+        let notifier = worker.sender();
+        self.worker = Some(worker);
+
+        let shared = Arc::clone(&self.shared);
+        let window = match aviutl2_eframe::EframeWindow::new(WINDOW_NAME, move |cc, handle| {
+            Ok(Box::new(gui::MediaProbeApp::new(cc, handle, shared, notifier, plugin_dir)))
+        }) {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::error!("素材情報のウィンドウを作れませんでした: {e:#}");
+                return;
+            }
+        };
+        match window.handle() {
+            Ok(handle) => {
+                if let Err(e) = registry.register_window_client(WINDOW_NAME, &handle) {
+                    tracing::error!("register_window_client 失敗: {e}");
+                }
+            }
+            Err(e) => tracing::error!("素材情報のウィンドウのハンドルを取れませんでした: {e:#}"),
+        }
+        *self.window.lock() = Some(window);
+    }
+
+    /// フォーカスが変わったら通知だけを送る（読み取りはスレッドで行う。ここでは本体の API を呼ばない）
+    fn event_change_focus_object(&mut self) {
+        if let Some(w) = &self.worker {
+            w.sender().changed();
+        }
+    }
+
+    /// 設定が変わったとき（ファイルを差し替えたなど）も読み直す
+    fn event_update_object_info(&mut self) {
+        if let Some(w) = &self.worker {
+            w.sender().changed();
+        }
+    }
+}
+
+impl Drop for MediaProbePlugin {
+    fn drop(&mut self) {
+        // 本体が DLL を外す前に、調べる処理のスレッドを止めて終わりを待つ（Worker の Drop）
+        self.worker.take();
+    }
+}
+
+aviutl2::register_generic_plugin!(MediaProbePlugin);

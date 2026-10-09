@@ -1,0 +1,29 @@
+#:schema ./.aviutl2-cli/aviutl2.schema.json
+#
+# ビルドと配布の設定（aviutl2-cli: https://github.com/sevenc-nanashi/aviutl2-cli）。
+#   au2 release   テストしてからビルドし、release/ に au2pkg を作る
+# project.version は Cargo.toml の version と揃える。
+
+[project]
+id = "HexBrowns.MediaProbe_H"
+name = "MediaProbe_H"
+version = "0.2.0"
+
+[artifacts."MediaProbe_H.aux2"]
+build = "cargo build --release"
+source = "target/release/media_probe_h.dll"
+destination = "Plugin/MediaProbe_H/MediaProbe_H.aux2"
+
+[release]
+# テストの後、インストール時のダイアログに本体と依存クレートのライセンスを出す
+prebuild = [
+    "cargo test",
+    'copy /b /y LICENSE + THIRD_PARTY_CRATES.md release\package.txt >nul',
+]
+package_template = "release/package.txt"
+package_information = "{name} v{version} by HexBrowns"
+
+[catalog]
+id = "HexBrowns.MediaProbe_H"
+license_path = { type = "MIT", path = "./LICENSE" }
+download_repo = { owner = "HexBrowns", repo = "MediaProbe_H" }
