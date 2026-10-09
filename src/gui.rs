@@ -322,6 +322,10 @@ impl MediaProbeApp {
 
 impl eframe::App for MediaProbeApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // 見えていない間に選び直していたら、見えた今、最新の分を 1 回だけ調べる（`lib.rs` の `notify_changed`）
+        if crate::window_visible() && crate::take_missed() {
+            self.notifier.changed();
+        }
         let status = self.shared.read().status.clone();
         egui::Panel::bottom("bottom").show(ui, |ui| {
             ui.horizontal(|ui| {

@@ -14,14 +14,39 @@ mod probe;
 mod worker;
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::Arc;
 
+use aviutl2::raw_window_handle::HasWindowHandle;
 use aviutl2::AnyResult;
 use parking_lot::{Mutex, RwLock};
 
 use worker::{Shared, SharedState, Status, Worker, EDIT_HANDLE};
 
 pub const WINDOW_NAME: &str = "素材情報";
+
+/// ウィンドウの HWND（見えているかを調べるため）
+static WINDOW_HWND: AtomicIsize = AtomicIsize::new(0);
+
+/// ウィンドウが見えていない間に来たイベントの印。見えたときに 1 回だけ調べる（v0.2.1。
+/// 出していない間も、選ぶたびに ffprobe を起こしていた。`issues/20261010_probes_while_hidden.md`）
+static MISSED: AtomicBool = AtomicBool::new(false);
+
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn IsWindowVisible(hwnd: isize) -> i32;
+}
+
+/// ウィンドウが見えているか（本体のパネルに出ていなければ偽）。ハンドルが取れていなければ見えているとみなす
+pub(crate) fn window_visible() -> bool {
+    let hwnd = WINDOW_HWND.load(Ordering::Acquire);
+    hwnd == 0 || unsafe { IsWindowVisible(hwnd) } != 0
+}
+
+/// 見えていない間にイベントが来ていたか（読んだら下ろす）
+pub(crate) fn take_missed() -> bool {
+    MISSED.swap(false, Ordering::AcqRel)
+}
 
 fn init_logging() {
     use aviutl2::tracing::Level;
@@ -58,6 +83,19 @@ pub struct MediaProbePlugin {
     window: Mutex<Option<aviutl2_eframe::EframeWindow>>,
     shared: SharedState,
     worker: Option<Worker>,
+}
+
+impl MediaProbePlugin {
+    /// 調べ直しを頼む。ウィンドウが見えていなければ印だけ立てる（見えたときに `gui.rs` が頼む）
+    fn notify_changed(&self) {
+        if !window_visible() {
+            MISSED.store(true, Ordering::Release);
+            return;
+        }
+        if let Some(w) = &self.worker {
+            w.sender().changed();
+        }
+    }
 }
 
 impl aviutl2::generic::GenericPlugin for MediaProbePlugin {
@@ -103,6 +141,11 @@ impl aviutl2::generic::GenericPlugin for MediaProbePlugin {
                 if let Err(e) = registry.register_window_client(WINDOW_NAME, &handle) {
                     tracing::error!("register_window_client 失敗: {e}");
                 }
+                if let Ok(raw) = handle.window_handle() {
+                    if let aviutl2::raw_window_handle::RawWindowHandle::Win32(h) = raw.as_raw() {
+                        WINDOW_HWND.store(h.hwnd.get(), Ordering::Release);
+                    }
+                }
             }
             Err(e) => tracing::error!("素材情報のウィンドウのハンドルを取れませんでした: {e:#}"),
         }
@@ -111,16 +154,12 @@ impl aviutl2::generic::GenericPlugin for MediaProbePlugin {
 
     /// フォーカスが変わったら通知だけを送る（読み取りはスレッドで行う。ここでは本体の API を呼ばない）
     fn event_change_focus_object(&mut self) {
-        if let Some(w) = &self.worker {
-            w.sender().changed();
-        }
+        self.notify_changed();
     }
 
     /// 設定が変わったとき（ファイルを差し替えたなど）も読み直す
     fn event_update_object_info(&mut self) {
-        if let Some(w) = &self.worker {
-            w.sender().changed();
-        }
+        self.notify_changed();
     }
 }
 
