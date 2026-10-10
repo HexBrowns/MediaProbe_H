@@ -5,7 +5,7 @@
 //! - ffprobe は新しい依頼が来たら途中でやめる（古い依頼は捨てて最新だけを調べる）
 //! - 結果は「パス + 更新日時 + 大きさ」で覚える（同じファイルは 2 回調べない）
 //! - 第 2 段階: 表示中のシーンの素材をまとめて調べる（`Msg::ScanScene`）、可変の判定をファイル全体で行う（`Msg::Whole`）。
-//!   まとめて調べている間は、選んだ素材は終わってから調べる
+//!   まとめて調べている間は、フォーカス中の素材は終わってから調べる
 //! - プラグインの `Drop` で止める合図を出し、動いている ffprobe を殺してから終わりを待つ
 //!   （`.claude/rules/au2-rs-plugin.md`「裏のスレッドは、プラグインが外れる前に止めて終わりを待つ」）
 
@@ -63,13 +63,25 @@ pub enum Status {
     Error(String),
 }
 
+/// シーンの素材を使うオブジェクト 1 つ（行をクリックしたときにフォーカスを移す先）。
+///
+/// ハンドルはスキャンの後も持ち越すので、使う前に `SceneScan.scene_id` と、この効果の「ファイル」が
+/// `SceneItem.path` のままかを確かめる（`gui.rs` の `focus`。`.claude/rules/au2-plugin-checklist.md`「オブジェクトのハンドル」）
+#[derive(Debug, Clone)]
+pub struct SceneObject {
+    pub handle: ObjectHandle,
+    pub layer: usize,
+    pub start: usize,
+    /// この素材を読んでいる効果（動画ファイル / 音声ファイル / 画像ファイル）
+    pub effect: String,
+}
+
 /// シーンの素材 1 つ（同じファイルを使うオブジェクトはまとめる）
 #[derive(Debug, Clone)]
 pub struct SceneItem {
     pub path: PathBuf,
     pub effect: String,
-    /// (ハンドル, レイヤー, 開始フレーム)
-    pub objects: Vec<(ObjectHandle, usize, usize)>,
+    pub objects: Vec<SceneObject>,
     pub findings: Vec<Finding>,
     pub error: Option<String>,
 }
@@ -86,6 +98,8 @@ pub struct SceneScan {
     pub done: usize,
     pub total: usize,
     pub scene_name: String,
+    /// 調べたシーンの ID（行のクリックで、今のシーンと同じかを確かめる）
+    pub scene_id: Option<i32>,
     pub items: Vec<SceneItem>,
     pub finished: bool,
     pub error: Option<String>,
@@ -143,7 +157,7 @@ impl Worker {
 #[derive(Clone)]
 pub struct Notifier {
     tx: Sender<Msg>,
-    /// フォーカスの依頼の世代（新しい依頼が来たら、選んだ素材の調べを途中でやめる）
+    /// フォーカスの依頼の世代（新しい依頼が来たら、フォーカス中の素材の調べを途中でやめる）
     gen: Arc<AtomicU64>,
     /// 「まとめて調べる」「全体で判定」の世代（「やめる」でだけ進める。フォーカスの変化では止めない）
     job: Arc<AtomicU64>,
@@ -239,7 +253,11 @@ impl Ctx {
 }
 
 fn hint() -> String {
-    "動画・音声・画像のオブジェクトを選ぶと、素材ファイルの情報を出します".into()
+    concat!(
+        "フォーカス中のオブジェクト（オブジェクト設定に出ている 1 つ）が動画・音声・画像なら、その素材ファイルの情報を出します。",
+        "複数を選んでいても、出すのはフォーカス中のオブジェクトだけです"
+    )
+    .into()
 }
 
 /// フォーカス中のオブジェクトの素材ファイルと、本体が読んだときの情報
@@ -270,14 +288,17 @@ fn read_focused() -> Result<Option<(String, PathBuf, Option<HostMedia>)>, String
         .map_err(|e| format!("読み取りに失敗しました: {e:?}"))
 }
 
-/// 表示中のシーンの素材ファイルを全部読む（同じファイルはまとめる）
-fn read_scene_media() -> Result<(String, Vec<SceneItem>), String> {
+/// 表示中のシーンの素材ファイルを全部読む（同じファイルはまとめる）。シーンの名前と ID も返す
+fn read_scene_media() -> Result<(String, i32, Vec<SceneItem>), String> {
     if !EDIT_HANDLE.is_ready() {
         return Err("本体の準備ができていません".into());
     }
-    let layer_max = EDIT_HANDLE.get_edit_info().layer_max;
     EDIT_HANDLE
         .call_read_section(move |read| {
+            // 読み取りの中で取る（同じスレッドが持っている参照ロックのまま読める。plugin2.h の get_edit_info）。
+            // 外で取ると、その間にシーンが切り替わったときに ID と中身が食い違う
+            let info = EDIT_HANDLE.get_edit_info();
+            let (layer_max, scene_id) = (info.layer_max, info.scene_id);
             let name = read.get_scene_name().unwrap_or_default();
             let mut items: Vec<SceneItem> = Vec::new();
             for layer in 0..=layer_max {
@@ -288,12 +309,13 @@ fn read_scene_media() -> Result<(String, Vec<SceneItem>), String> {
                             break;
                         }
                         let path = PathBuf::from(&file);
+                        let object = SceneObject { handle, layer: lf.layer, start: lf.start, effect: effect.to_string() };
                         match items.iter_mut().find(|i| i.path == path) {
-                            Some(i) => i.objects.push((handle, lf.layer, lf.start)),
+                            Some(i) => i.objects.push(object),
                             None => items.push(SceneItem {
                                 path,
                                 effect: effect.to_string(),
-                                objects: vec![(handle, lf.layer, lf.start)],
+                                objects: vec![object],
                                 findings: Vec::new(),
                                 error: None,
                             }),
@@ -302,7 +324,7 @@ fn read_scene_media() -> Result<(String, Vec<SceneItem>), String> {
                     }
                 }
             }
-            (name, items)
+            (name, scene_id, items)
         })
         .map_err(|e| format!("読み取りに失敗しました: {e:?}"))
 }
@@ -406,12 +428,13 @@ fn scan(c: &mut Ctx) {
     let Some(exe) = c.ffprobe() else {
         return fail(c, "ffprobe.exe が見つかりません。下の「設定」で場所を指定してください".into());
     };
-    let (scene_name, mut items) = match read_scene_media() {
+    let (scene_name, scene_id, mut items) = match read_scene_media() {
         Ok(x) => x,
         Err(e) => return fail(c, e),
     };
     let scene = scene_settings();
-    c.shared.write().scan = SceneScan { running: true, total: items.len(), scene_name: scene_name.clone(), ..Default::default() };
+    c.shared.write().scan =
+        SceneScan { running: true, total: items.len(), scene_name: scene_name.clone(), scene_id: Some(scene_id), ..Default::default() };
     c.repaint();
     let (stop, job) = (Arc::clone(&c.stop), Arc::clone(&c.job));
     let cancel = move || stop.load(Ordering::Acquire) || job.load(Ordering::Acquire) != my_job;
@@ -437,7 +460,8 @@ fn scan(c: &mut Ctx) {
     }
     let warn = items.iter().filter(|i| i.warns() > 0).count();
     tracing::info!("MediaProbe_H: シーンの素材 {} 個を調べた（注意あり {warn} 個、{:.1} 秒）", items.len(), started.elapsed().as_secs_f64());
-    c.shared.write().scan = SceneScan { running: false, done: items.len(), total: items.len(), scene_name, items, finished: true, error: None };
+    c.shared.write().scan =
+        SceneScan { running: false, done: items.len(), total: items.len(), scene_name, scene_id: Some(scene_id), items, finished: true, error: None };
     c.repaint();
 }
 

@@ -1,19 +1,19 @@
 //! 素材情報のウィンドウ（egui）
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use aviutl2_eframe::{eframe, egui, AviUtl2EframeHandle};
 
 use crate::check::{fps_label, khz, Level};
 use crate::probe::{self, FrameRateKind};
-use crate::worker::{Notifier, Probed, SceneItem, SharedState, Status, EDIT_HANDLE};
+use crate::worker::{Notifier, Probed, SceneItem, SceneObject, SharedState, Status, EDIT_HANDLE};
 
 const YELLOW: egui::Color32 = egui::Color32::from_rgb(235, 200, 90);
 const RED: egui::Color32 = egui::Color32::from_rgb(235, 110, 110);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
-    /// 選んでいるオブジェクトの素材
+    /// フォーカス中のオブジェクト（1 つだけ）の素材
     Focused,
     /// 表示中のシーンの素材をまとめて（第 2 段階）
     Scene,
@@ -32,18 +32,45 @@ pub struct MediaProbeApp {
     warn_only: bool,
 }
 
-/// 一覧の行をクリックしたときだけ、そのオブジェクトにフォーカスを移す（`call_edit_section`。マウスは離れている）
-fn focus(handle: aviutl2::generic::ObjectHandle) -> Result<(), String> {
+/// スキャンの後も持ち越したハンドルが、まだ調べたときのオブジェクトを指しているか。
+///
+/// - シーン: 調べたシーンの ID と今のシーンの ID が同じ
+/// - 存在: `object_exists`
+/// - 同じオブジェクト: その効果の「ファイル」が、調べたときの素材のまま（ハンドルの値が別のオブジェクトに
+///   使い回されるかは分かっていないので、中身で確かめる）
+fn check_focus_target(
+    scanned_scene: Option<i32>,
+    current_scene: i32,
+    exists: bool,
+    current_file: Option<&str>,
+    expected: &Path,
+) -> Result<(), String> {
+    if scanned_scene != Some(current_scene) {
+        return Err("調べたときとシーンが違います。調べたシーンに戻すか、「シーンの素材を調べる」で調べ直してください".into());
+    }
+    if !exists {
+        return Err("オブジェクトが見つかりません（消されたかもしれません）。調べ直してください".into());
+    }
+    match current_file {
+        Some(f) if Path::new(f) == expected => Ok(()),
+        _ => Err("オブジェクトが見つかりません（素材が差し替えられたかもしれません）。調べ直してください".into()),
+    }
+}
+
+/// 一覧の行をクリックしたときだけ、そのオブジェクトにフォーカスを移す（`call_edit_section`。マウスは離れている）。
+/// 移す前に、調べたときと同じシーン・同じオブジェクトかを確かめる。確かめられなければ何もしない
+fn focus(scanned_scene: Option<i32>, object: SceneObject, expected: PathBuf) -> Result<(), String> {
     if !EDIT_HANDLE.is_ready() {
         return Err("本体の準備ができていません".into());
     }
     EDIT_HANDLE
         .call_edit_section(move |edit| {
-            if edit.object_exists(handle) {
-                let _ = edit.set_focus_object(Some(handle));
-            }
+            let exists = edit.object_exists(object.handle);
+            let file = if exists { edit.get_object_effect_item(object.handle, &object.effect, 0, "ファイル").ok() } else { None };
+            check_focus_target(scanned_scene, edit.info.scene_id, exists, file.as_deref(), &expected)?;
+            edit.set_focus_object(Some(object.handle)).map_err(|e| format!("フォーカスを移せませんでした: {e:?}"))
         })
-        .map_err(|e| format!("フォーカスを移せませんでした: {e:?}"))
+        .map_err(|e| format!("フォーカスを移せませんでした: {e:?}"))?
 }
 
 fn size_text(n: u64) -> String {
@@ -244,10 +271,10 @@ impl MediaProbeApp {
             });
             ui.horizontal_wrapped(|ui| {
                 ui.add_space(12.0);
-                for (h, layer, start) in &item.objects {
-                    let b = ui.add(egui::Label::new(egui::RichText::new(format!("L{} {start}", layer + 1)).monospace()).sense(egui::Sense::click()));
+                for o in &item.objects {
+                    let b = ui.add(egui::Label::new(egui::RichText::new(format!("L{} {}", o.layer + 1, o.start)).monospace()).sense(egui::Sense::click()));
                     if b.on_hover_text("クリックでこのオブジェクトにフォーカスを移す").clicked() {
-                        clicked = Some(*h);
+                        clicked = Some((o.clone(), item.path.clone()));
                     }
                 }
             });
@@ -260,10 +287,11 @@ impl MediaProbeApp {
             }
             ui.add_space(4.0);
         }
-        if let Some(h) = clicked {
-            // フォーカスが移ると、「選んだ素材」の欄にも詳しく出る
-            if let Err(e) = focus(h) {
-                self.note = e;
+        if let Some((object, path)) = clicked {
+            // フォーカスが移ると、「フォーカス中のオブジェクト」の欄にも詳しく出る
+            match focus(scan.scene_id, object, path) {
+                Ok(()) => self.note.clear(),
+                Err(e) => self.note = e,
             }
         }
         if !self.note.is_empty() {
@@ -346,7 +374,8 @@ impl eframe::App for MediaProbeApp {
         // 中央パネルは最後に追加する
         egui::Panel::top("tabs").show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.tab, Tab::Focused, "選んだ素材");
+                ui.selectable_value(&mut self.tab, Tab::Focused, "フォーカス中のオブジェクト")
+                    .on_hover_text("オブジェクト設定に出ている 1 つの素材を出します（複数を選んでいても 1 つだけ）");
                 ui.selectable_value(&mut self.tab, Tab::Scene, "シーンの素材");
             });
         });
@@ -371,5 +400,37 @@ impl eframe::App for MediaProbeApp {
                 Status::Done(p) => self.render_probed(ui, p),
             });
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FILE: &str = "D:/素材/clip.mp4";
+
+    #[test]
+    fn focus_target_same_scene_same_file() {
+        assert!(check_focus_target(Some(2), 2, true, Some(FILE), Path::new(FILE)).is_ok());
+    }
+
+    /// スキャンの後にシーンを切り替えたら、表示していないシーンのオブジェクトへは移さない
+    #[test]
+    fn focus_target_rejects_other_scene() {
+        let e = check_focus_target(Some(2), 3, true, Some(FILE), Path::new(FILE)).unwrap_err();
+        assert!(e.contains("シーン"), "{e}");
+        // 調べていない（ID が無い）ときも移さない
+        assert!(check_focus_target(None, 0, true, Some(FILE), Path::new(FILE)).is_err());
+    }
+
+    #[test]
+    fn focus_target_rejects_deleted_or_replaced() {
+        let e = check_focus_target(Some(0), 0, false, None, Path::new(FILE)).unwrap_err();
+        assert!(e.contains("見つかりません"), "{e}");
+        // ハンドルが別のオブジェクトを指している・素材が差し替えられた
+        let e = check_focus_target(Some(0), 0, true, Some("D:/素材/other.mp4"), Path::new(FILE)).unwrap_err();
+        assert!(e.contains("見つかりません"), "{e}");
+        // その効果が無い（「ファイル」が読めない）
+        assert!(check_focus_target(Some(0), 0, true, None, Path::new(FILE)).is_err());
     }
 }

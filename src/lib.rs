@@ -1,6 +1,6 @@
 //! MediaProbe_H（素材情報）
 //!
-//! 選んでいる動画・音声・画像オブジェクトの素材ファイルについて、コーデック・フレームレート（可変かどうか）・色空間・
+//! フォーカス中の動画・音声・画像オブジェクトの素材ファイルについて、コーデック・フレームレート（可変かどうか）・色空間・
 //! ビット深度・サンプルレートを出し、シーンの設定と合わないものに印を付ける。情報は ffprobe で取る。
 //! 仕様は `AI/specifications/20261005_MediaInfo_H_spec.md`（企画時の名前は MediaInfo_H。MediaInfo は他者の製品名なので改めた）。
 //!
@@ -70,12 +70,62 @@ pub fn load_ffprobe_setting() -> Option<PathBuf> {
 }
 
 pub fn save_ffprobe_setting(path: Option<&std::path::Path>) -> Result<(), String> {
-    let p = settings_path();
+    save_ffprobe_setting_at(&settings_path(), path)
+}
+
+/// 設定ファイルの `ffprobe` だけを差し替えて書く（v0.2.1 までは `ffprobe` だけの JSON で丸ごと上書きしていたので、
+/// 新しい版が足したキーを古い版で保存すると消えた。`issues/20261010_publish_checklist_audit.md`）。
+///
+/// - 書く直前にファイルを読み、ほかのキーはそのまま残す
+/// - 読めない（JSON のオブジェクトでない・UTF-8 でない・ロック中など）なら `設定.json.broken` へ退避してから書く。
+///   退避できなければ書かない（利用者の設定を消さない）
+/// - 一時ファイルに書いてから置き換える（書いている途中で落ちても壊れたファイルを残さない）
+fn save_ffprobe_setting_at(p: &std::path::Path, ffprobe: Option<&std::path::Path>) -> Result<(), String> {
     if let Some(dir) = p.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(dir).map_err(|e| format!("設定を保存できませんでした: {e}"))?;
     }
-    let v = serde_json::json!({ "ffprobe": path.map(|p| p.to_string_lossy().into_owned()).unwrap_or_default() });
-    std::fs::write(&p, serde_json::to_string_pretty(&v).unwrap_or_default()).map_err(|e| format!("設定を保存できませんでした: {e}"))
+    let mut map = match read_settings_object(p) {
+        Ok(m) => m,
+        Err(why) => {
+            let broken = sibling_path(p, ".broken");
+            std::fs::rename(p, &broken)
+                .map_err(|e| format!("設定ファイルを読めず、退避もできなかったので保存しませんでした（{why} / {e}）"))?;
+            tracing::warn!("MediaProbe_H: 設定ファイルを読めなかったので {} へ退避した（{why}）", broken.display());
+            serde_json::Map::new()
+        }
+    };
+    let value = ffprobe.map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+    map.insert("ffprobe".into(), serde_json::Value::String(value));
+    let text = serde_json::to_string_pretty(&serde_json::Value::Object(map)).map_err(|e| format!("設定を保存できませんでした: {e}"))?;
+    let tmp = sibling_path(p, ".tmp");
+    let written = std::fs::write(&tmp, text.as_bytes()).and_then(|_| std::fs::rename(&tmp, p));
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("設定を保存できませんでした: {e}"));
+    }
+    Ok(())
+}
+
+/// 設定ファイルを JSON のオブジェクトとして読む。ファイルが無ければ空。読めなければ理由
+fn read_settings_object(p: &std::path::Path) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let bytes = match std::fs::read(p) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(serde_json::Map::new()),
+        Err(e) => return Err(format!("読み込みに失敗: {e}")),
+    };
+    let text = String::from_utf8(bytes).map_err(|_| "UTF-8 ではない".to_string())?;
+    match serde_json::from_str(text.trim_start_matches('\u{feff}')) {
+        Ok(serde_json::Value::Object(m)) => Ok(m),
+        Ok(_) => Err("JSON のオブジェクトではない".into()),
+        Err(e) => Err(format!("JSON として読めない: {e}")),
+    }
+}
+
+/// `設定.json` → `設定.json.broken` のように、名前の後ろに付け足したパス
+fn sibling_path(p: &std::path::Path, suffix: &str) -> PathBuf {
+    let mut name = p.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    name.push(suffix);
+    p.with_file_name(name)
 }
 
 #[aviutl2::plugin(GenericPlugin)]
@@ -167,6 +217,71 @@ impl Drop for MediaProbePlugin {
     fn drop(&mut self) {
         // 本体が DLL を外す前に、調べる処理のスレッドを止めて終わりを待つ（Worker の Drop）
         self.worker.take();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn temp_settings(name: &str) -> PathBuf {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target").join("settings_test").join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("設定.json")
+    }
+
+    fn read_json(p: &Path) -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()
+    }
+
+    /// 新しい版が足したキー（ここでは "window" と "future"）を、保存しても消さない
+    #[test]
+    fn save_keeps_unknown_keys() {
+        let p = temp_settings("keep");
+        std::fs::write(&p, "\u{feff}{\"ffprobe\": \"C:/old/ffprobe.exe\", \"future\": 3, \"window\": {\"w\": 640}}").unwrap();
+        save_ffprobe_setting_at(&p, Some(Path::new("D:/ffmpeg/ffprobe.exe"))).unwrap();
+        let v = read_json(&p);
+        assert_eq!(v["ffprobe"], "D:/ffmpeg/ffprobe.exe");
+        assert_eq!(v["future"], 3);
+        assert_eq!(v["window"]["w"], 640);
+        assert!(!sibling_path(&p, ".tmp").exists(), "一時ファイルが残った");
+        assert!(!sibling_path(&p, ".broken").exists());
+    }
+
+    /// 空で保存すると "ffprobe" は空文字（読むときは「探す」になる）。ほかのキーは残る
+    #[test]
+    fn save_empty_clears_only_ffprobe() {
+        let p = temp_settings("empty");
+        std::fs::write(&p, r#"{"ffprobe": "C:/x/ffprobe.exe", "future": true}"#).unwrap();
+        save_ffprobe_setting_at(&p, None).unwrap();
+        let v = read_json(&p);
+        assert_eq!(v["ffprobe"], "");
+        assert_eq!(v["future"], true);
+    }
+
+    #[test]
+    fn save_creates_new_file() {
+        let p = temp_settings("new");
+        save_ffprobe_setting_at(&p, Some(Path::new("C:/a/ffprobe.exe"))).unwrap();
+        assert_eq!(read_json(&p), serde_json::json!({ "ffprobe": "C:/a/ffprobe.exe" }));
+    }
+
+    /// 読めないファイルは上書きせずに退避してから書く
+    #[test]
+    fn save_backs_up_broken_file() {
+        let p = temp_settings("broken");
+        std::fs::write(&p, "{ not json").unwrap();
+        save_ffprobe_setting_at(&p, Some(Path::new("C:/a/ffprobe.exe"))).unwrap();
+        assert_eq!(std::fs::read_to_string(sibling_path(&p, ".broken")).unwrap(), "{ not json");
+        assert_eq!(read_json(&p)["ffprobe"], "C:/a/ffprobe.exe");
+
+        // JSON でもオブジェクトでなければ同じ
+        let p = temp_settings("array");
+        std::fs::write(&p, "[1, 2]").unwrap();
+        save_ffprobe_setting_at(&p, None).unwrap();
+        assert_eq!(std::fs::read_to_string(sibling_path(&p, ".broken")).unwrap(), "[1, 2]");
     }
 }
 
