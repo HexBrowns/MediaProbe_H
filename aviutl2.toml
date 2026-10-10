@@ -7,7 +7,7 @@
 [project]
 id = "HexBrowns.MediaProbe_H"
 name = "MediaProbe_H"
-version = "0.2.2"
+version = "0.3.0"
 
 [artifacts."MediaProbe_H.aux2"]
 build = "cargo build --release"

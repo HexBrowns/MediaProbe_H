@@ -73,6 +73,27 @@ fn focus(scanned_scene: Option<i32>, object: SceneObject, expected: PathBuf) -> 
         .map_err(|e| format!("フォーカスを移せませんでした: {e:?}"))?
 }
 
+/// 1 行の入力欄の後に呼ぶ（ルール au2-rs-plugin「入力の確定と取り消し」。参照実装 MidpointTable_H の `number_text`）。
+/// フォーカスを得たときの文字を覚えておき、入力中の Esc でフォーカスが外れたらそこへ戻す。
+/// Enter で確定してフォーカスが外れたフレームだけ `true` を返す（ほかをクリックして外れたときは確定しない）
+fn revert_on_escape(ui: &egui::Ui, resp: &egui::Response, text: &mut String) -> bool {
+    let key = resp.id.with("before_edit");
+    if resp.gained_focus() {
+        ui.data_mut(|d| d.insert_temp(key, text.clone()));
+    }
+    if !resp.lost_focus() {
+        return false;
+    }
+    let before = ui.data_mut(|d| d.remove_temp::<String>(key));
+    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        if let Some(b) = before {
+            *text = b;
+        }
+        return false;
+    }
+    ui.input(|i| i.key_pressed(egui::Key::Enter))
+}
+
 fn size_text(n: u64) -> String {
     let f = n as f64;
     if f >= 1e9 {
@@ -203,22 +224,13 @@ impl MediaProbeApp {
     fn render_settings(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label("ffprobe.exe:");
-            ui.add(egui::TextEdit::singleline(&mut self.ffprobe_text).desired_width(260.0).hint_text("空なら PATH と Plugin フォルダから探す"));
-            if ui.button("保存").clicked() {
-                let t = self.ffprobe_text.trim().trim_matches('"');
-                let p = (!t.is_empty()).then(|| PathBuf::from(t));
-                if let Some(p) = p.as_ref().filter(|p| !p.is_file()) {
-                    self.note = format!("{} が見つかりません", p.display());
-                } else {
-                    match crate::save_ffprobe_setting(p.as_deref()) {
-                        Ok(()) => {
-                            self.shared.write().ffprobe_setting = p;
-                            self.note = "保存しました".into();
-                            self.notifier.force();
-                        }
-                        Err(e) => self.note = e,
-                    }
-                }
+            // 打っている間は何もしない（保存するのは「保存」か Enter のときだけ）。入力中の Esc で入力前の文字に戻す
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.ffprobe_text).id_salt("ffprobe_path").desired_width(260.0).hint_text("空なら PATH と Plugin フォルダから探す"),
+            );
+            let enter = revert_on_escape(ui, &resp, &mut self.ffprobe_text);
+            if ui.button("保存").clicked() || enter {
+                self.save_ffprobe();
             }
         });
         let setting = self.shared.read().ffprobe_setting.clone();
@@ -229,6 +241,24 @@ impl MediaProbeApp {
         });
         if !self.note.is_empty() {
             ui.weak(&self.note);
+        }
+    }
+
+    /// 「保存」・Enter: ffprobe.exe の場所を設定ファイルへ書く
+    fn save_ffprobe(&mut self) {
+        let t = self.ffprobe_text.trim().trim_matches('"');
+        let p = (!t.is_empty()).then(|| PathBuf::from(t));
+        if let Some(p) = p.as_ref().filter(|p| !p.is_file()) {
+            self.note = format!("{} が見つかりません", p.display());
+        } else {
+            match crate::save_ffprobe_setting(p.as_deref()) {
+                Ok(()) => {
+                    self.shared.write().ffprobe_setting = p;
+                    self.note = "保存しました".into();
+                    self.notifier.force();
+                }
+                Err(e) => self.note = e,
+            }
         }
     }
 
@@ -405,9 +435,75 @@ impl eframe::App for MediaProbeApp {
 
 #[cfg(test)]
 mod tests {
+    /// テストの 1 フレームの出力を捨てる。テクスチャの差分を片付けずに捨てると、デバッグビルドで epaint の debug_assert
+    /// （Dropped TexturesDelta with N unapplied deltas）が落ちる（au2 release の prebuild の cargo test はデバッグビルド）
+    fn discard_frame(mut out: egui::FullOutput) {
+        out.textures_delta.clear();
+    }
+
     use super::*;
 
     const FILE: &str = "D:/素材/clip.mp4";
+
+    fn key(k: egui::Key) -> egui::Event {
+        egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }
+    }
+
+    /// 画面なしで 1 フレーム描く。`focus` なら欄を描く前にフォーカスを渡す（クリックの代わり）。
+    /// 返り値は欄の ID と、Enter で確定したか
+    fn frame(ctx: &egui::Context, text: &mut String, events: Vec<egui::Event>, focus: Option<egui::Id>) -> (egui::Id, bool) {
+        let mut out = (egui::Id::NULL, false);
+        let input = egui::RawInput { events, ..Default::default() };
+        discard_frame(ctx.run_ui(input, |ui| {
+            if let Some(f) = focus {
+                ui.memory_mut(|m| m.request_focus(f));
+            }
+            let resp = ui.add(egui::TextEdit::singleline(text).id_salt("path"));
+            out = (resp.id, revert_on_escape(ui, &resp, text));
+        }));
+        out
+    }
+
+    /// 入力中の Esc は入力前の文字に戻し、確定もしない
+    #[test]
+    fn path_text_reverts_on_escape() {
+        let ctx = egui::Context::default();
+        let mut text = String::from("C:/ffmpeg/ffprobe.exe");
+        let (id, _) = frame(&ctx, &mut text, vec![], None);
+        frame(&ctx, &mut text, vec![], Some(id));
+        let (_, enter) = frame(&ctx, &mut text, vec![egui::Event::Text("x".into())], None);
+        assert!(!enter);
+        assert_eq!(text, "C:/ffmpeg/ffprobe.exex");
+        let (_, enter) = frame(&ctx, &mut text, vec![key(egui::Key::Escape)], None);
+        assert!(!enter);
+        assert_eq!(text, "C:/ffmpeg/ffprobe.exe");
+    }
+
+    /// Enter は確定（保存する合図）。ほかをクリックして外れたときは確定しない
+    #[test]
+    fn path_text_commits_only_on_enter() {
+        let ctx = egui::Context::default();
+        let mut text = String::new();
+        let (id, _) = frame(&ctx, &mut text, vec![], None);
+        frame(&ctx, &mut text, vec![], Some(id));
+        frame(&ctx, &mut text, vec![egui::Event::Text("D:/ffprobe.exe".into())], None);
+        let (_, enter) = frame(&ctx, &mut text, vec![key(egui::Key::Enter)], None);
+        assert!(enter);
+        assert_eq!(text, "D:/ffprobe.exe");
+
+        frame(&ctx, &mut text, vec![], Some(id));
+        frame(&ctx, &mut text, vec![egui::Event::Text("x".into())], None);
+        let blurred = egui::RawInput::default();
+        let mut enter = true;
+        discard_frame(ctx.run_ui(blurred, |ui| {
+            ui.memory_mut(|m| m.surrender_focus(id));
+            let resp = ui.add(egui::TextEdit::singleline(&mut text).id_salt("path"));
+            enter = revert_on_escape(ui, &resp, &mut text);
+        }));
+        assert!(!enter);
+        // 打った文字は欄に残る（保存はしていない）
+        assert_eq!(text, "D:/ffprobe.exex");
+    }
 
     #[test]
     fn focus_target_same_scene_same_file() {
