@@ -21,6 +21,8 @@ enum Tab {
 
 pub struct MediaProbeApp {
     _handle: AviUtl2EframeHandle,
+    /// 本体のフォント（窓が見えてから読む。`host_fonts`）
+    host_fonts: crate::host_fonts::LazyFonts,
     shared: SharedState,
     notifier: Notifier,
     plugin_dir: PathBuf,
@@ -215,10 +217,11 @@ impl MediaProbeApp {
         cc.egui_ctx.all_styles_mut(|style| {
             style.visuals = aviutl2_eframe::aviutl2_visuals();
         });
-        cc.egui_ctx.set_fonts(aviutl2_eframe::aviutl2_fonts());
+        // 本体のフォントは窓が見えてから ui で読む（ここで読むと、本体の起動がこの窓の初期化を待つ間ずっと止まる。`host_fonts`）
+        let host_fonts = crate::host_fonts::LazyFonts::new(&handle);
         let ffprobe_text = shared.read().ffprobe_setting.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
         shared.write().egui_ctx = Some(cc.egui_ctx.clone());
-        Self { _handle: handle, shared, notifier, plugin_dir, settings_open: false, ffprobe_text, note: String::new(), tab: Tab::Focused, warn_only: true }
+        Self { _handle: handle, host_fonts, shared, notifier, plugin_dir, settings_open: false, ffprobe_text, note: String::new(), tab: Tab::Focused, warn_only: true }
     }
 
     fn render_settings(&mut self, ui: &mut egui::Ui) {
@@ -380,6 +383,10 @@ impl MediaProbeApp {
 
 impl eframe::App for MediaProbeApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // 本体のフォントは窓が見えてから読む。読んだフレームは描かない（新しいフォントは次のフレームから効く。次のフレームは頼んである）
+        if self.host_fonts.load_if_visible(ui.ctx()) {
+            return;
+        }
         // 見えていない間に選び直していたら、見えた今、最新の分を 1 回だけ調べる（`lib.rs` の `notify_changed`）
         if crate::window_visible() && crate::take_missed() {
             self.notifier.changed();

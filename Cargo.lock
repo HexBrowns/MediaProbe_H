@@ -1415,7 +1415,7 @@ dependencies = [
 
 [[package]]
 name = "media-probe-h"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "aviutl2",
  "aviutl2-eframe",
@@ -1423,6 +1423,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tracing",
+ "windows",
 ]
 
 [[package]]
